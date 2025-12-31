@@ -2827,16 +2827,40 @@ Structural understanding is always understanding of relationships. Observational
           }
         }
         
+        // CRITICAL: Parse user's target length from custom instructions FIRST
+        // This determines the reconstruction method - not just input size
+        const { parseTargetLength, crossChunkReconstruct } = await import('./services/crossChunkCoherence');
+        const targetLength = parseTargetLength(customInstructions);
+        
+        // Determine if cross-chunk coherence is needed based on user's target
+        let forceCoherencePipeline = false;
+        let targetOutputWords = inputWordCount; // default: maintain length
+        
+        if (targetLength) {
+          targetOutputWords = Math.round((targetLength.targetMin + targetLength.targetMax) / 2);
+          const expansionRatio = targetOutputWords / inputWordCount;
+          
+          // Use cross-chunk coherence if:
+          // 1. Target output is large (>5000 words) - need coherence infrastructure
+          // 2. Significant expansion requested (>2x) - need skeleton-guided expansion
+          // 3. Significant compression of large doc (input >5000, ratio <0.5)
+          if (targetOutputWords > 5000 || expansionRatio > 2 || (inputWordCount > 5000 && expansionRatio < 0.5)) {
+            forceCoherencePipeline = true;
+            console.log(`[Reconstruction] User target detected: ${targetLength.targetMin}-${targetLength.targetMax} words (ratio: ${expansionRatio.toFixed(2)}x) - FORCING cross-chunk coherence`);
+          }
+        }
+        
         // Import the utility functions to determine the best method
         const { shouldUseOutlineFirst, getRecommendedMethod } = await import('./services/outlineFirstReconstruction');
-        const recommendedMethod = getRecommendedMethod(inputWordCount);
-        console.log(`[Reconstruction] Document: ${inputWordCount} words, recommended method: ${recommendedMethod}`);
+        const recommendedMethod = forceCoherencePipeline ? 'cross-chunk' : getRecommendedMethod(inputWordCount);
+        console.log(`[Reconstruction] Document: ${inputWordCount} words, target: ${targetOutputWords} words, method: ${recommendedMethod}`);
         
         // For medium-length documents (1200-25000 words), use Outline-First Reconstruction
         // This extracts a strict outline first, then reconstructs section-by-section
         // for global coherence (solving the "Frankenstein problem")
         // For very long documents (>25000 words), use cross-chunk approach instead
-        if (shouldUseOutlineFirst(inputWordCount)) {
+        // SKIP outline-first if user requested large expansion/compression - use cross-chunk instead
+        if (!forceCoherencePipeline && shouldUseOutlineFirst(inputWordCount)) {
           console.log(`[Outline-First] Processing medium document: ${inputWordCount} words`);
           try {
             const { outlineFirstReconstruct } = await import('./services/outlineFirstReconstruction');
@@ -2948,12 +2972,12 @@ ${'═'.repeat(60)}
           }
         }
         
-        // For very long documents (>25000 words), use cross-chunk reconstruction
+        // For very long documents (>25000 words) OR when user specifies large target, use cross-chunk reconstruction
         // This processes documents in chunks with global skeleton constraints
-        if (inputWordCount > 25000) {
-          console.log(`[Cross-Chunk] Processing very long document: ${inputWordCount} words`);
+        if (forceCoherencePipeline || inputWordCount > 25000) {
+          console.log(`[Cross-Chunk] Processing document: ${inputWordCount} words → target ${targetOutputWords} words (forced: ${forceCoherencePipeline})`);
           try {
-            const { crossChunkReconstruct } = await import('./services/crossChunkCoherence');
+            // crossChunkReconstruct already imported above when parsing target length
             
             // crossChunkReconstruct(text, audienceParameters, rigorLevel, customInstructions, contentAnalysis)
             const result = await crossChunkReconstruct(
