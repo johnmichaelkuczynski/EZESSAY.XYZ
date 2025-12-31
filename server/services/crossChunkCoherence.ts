@@ -522,12 +522,14 @@ async function callWithFallback(
   
   for (let attempt = 0; attempt <= MAX_TRUNCATION_RETRIES; attempt++) {
     try {
+      // Use longer timeout for large token requests (30 minutes max)
+      const timeoutMs = Math.min(currentMaxTokens * 100, 30 * 60 * 1000);
       const message = await getAnthropic().messages.create({
         model: PRIMARY_MODEL,
         max_tokens: Math.min(currentMaxTokens, CLAUDE_MAX_OUTPUT_TOKENS),
         temperature,
         messages: [{ role: "user", content: prompt }]
-      });
+      }, { timeout: timeoutMs });
       
       const text = message.content[0].type === 'text' ? message.content[0].text : '';
       const stopReason = message.stop_reason;
@@ -1146,7 +1148,10 @@ Return ONLY a JSON validation report:
   return { finalOutput, stitchResult };
 }
 
-// Expand short documents to meet large word targets
+// Maximum safe tokens for non-streaming (SDK throws error above ~21k)
+const SAFE_MAX_TOKENS = 16000;
+
+// Expand short documents to meet large word targets using iterative passes
 async function expandShortDocument(
   text: string,
   lengthConfig: LengthConfig,
@@ -1159,64 +1164,63 @@ async function expandShortDocument(
   
   console.log(`[CC] Expanding ${inputWords} words to target ${targetWords} words`);
   
-  const expansionPrompt = `You are an expert academic writer tasked with EXPANDING a short text into a comprehensive, well-structured document.
+  // For very large expansions, do it in passes - each pass can add ~2000-3000 words
+  let currentText = text;
+  let currentWords = inputWords;
+  let passNum = 0;
+  const maxPasses = Math.ceil(targetWords / 2500); // ~2500 words per pass max
+  
+  while (currentWords < lengthConfig.targetMin * 0.9 && passNum < maxPasses) {
+    passNum++;
+    const wordsNeeded = targetWords - currentWords;
+    const passTarget = Math.min(wordsNeeded, 3000); // Max 3000 words per pass
+    
+    console.log(`[CC] Expansion pass ${passNum}: ${currentWords} words → adding ~${passTarget} words`);
+    
+    const expansionPrompt = `You are an expert academic writer. Your task is to EXPAND the following text.
 
-ORIGINAL TEXT (${inputWords} words):
-${text}
+CURRENT TEXT (${currentWords} words):
+${currentText}
 
-TARGET LENGTH: ${lengthConfig.targetMin}-${lengthConfig.targetMax} words (aim for ~${targetWords} words)
+${passNum === 1 ? `ORIGINAL SEED (preserve this thesis): ${text}` : ''}
+
+EXPANSION TARGET: Add approximately ${passTarget} more words to reach closer to ${targetWords} total words.
 
 ${customInstructions ? `USER INSTRUCTIONS:\n${customInstructions}\n` : ''}
 ${audienceParameters ? `AUDIENCE: ${audienceParameters}\n` : ''}
-${rigorLevel ? `RIGOR LEVEL: ${rigorLevel}\n` : ''}
 
 EXPANSION REQUIREMENTS:
-1. PRESERVE the core thesis and all original claims
+1. PRESERVE all existing content and the core thesis
 2. ADD supporting arguments, evidence, examples, and elaboration
-3. DEVELOP each point with thorough explanation
-4. STRUCTURE the expanded text with clear sections
-5. MAINTAIN coherence - every addition must support the original argument
-6. DO NOT add filler or padding - every sentence must be substantive
-7. DO NOT contradict or undermine the original claims
+3. DEVELOP each major point with thorough explanation
+4. ADD new sections or subsections as appropriate
+5. MAINTAIN coherence - every addition must support the argument
+6. DO NOT add filler - every sentence must be substantive
+7. DO NOT contradict existing claims
 
-CRITICAL: You MUST produce approximately ${targetWords} words. Count your output carefully.
+OUTPUT: The complete expanded document (not just additions). Write it now:`;
 
-Write the expanded document now:`;
-
-  // Use Claude for expansion - best at following length instructions
-  const expandedText = await callWithFallback(expansionPrompt, Math.min(targetWords * 6, 64000), 0.7);
-  
-  const outputWords = countWords(expandedText);
-  console.log(`[CC] Expansion complete: ${inputWords} → ${outputWords} words (target: ${targetWords})`);
-  
-  // If significantly under target, do a second expansion pass
-  if (outputWords < lengthConfig.targetMin * 0.7) {
-    console.log(`[CC] Output under target, doing second expansion pass...`);
-    
-    const secondPassPrompt = `The following document needs to be EXPANDED further to meet the word count target.
-
-CURRENT DOCUMENT (${outputWords} words):
-${expandedText}
-
-TARGET: ${lengthConfig.targetMin}-${lengthConfig.targetMax} words
-
-Expand this document by:
-1. Adding more detailed examples and case studies
-2. Elaborating on each major point
-3. Adding transitional paragraphs
-4. Developing counterarguments and responses
-5. Including additional supporting evidence
-
-Produce the fully expanded document now:`;
-
-    const secondExpansion = await callWithFallback(secondPassPrompt, Math.min(targetWords * 6, 64000), 0.7);
-    const secondOutputWords = countWords(secondExpansion);
-    console.log(`[CC] Second pass complete: ${outputWords} → ${secondOutputWords} words`);
-    
-    return secondExpansion;
+    try {
+      const expandedText = await callWithFallback(expansionPrompt, SAFE_MAX_TOKENS, 0.7);
+      const newWords = countWords(expandedText);
+      
+      if (newWords <= currentWords) {
+        console.log(`[CC] Pass ${passNum} did not expand (${currentWords} → ${newWords}), stopping`);
+        break;
+      }
+      
+      currentText = expandedText;
+      currentWords = newWords;
+      console.log(`[CC] Pass ${passNum} complete: now at ${currentWords} words`);
+      
+    } catch (error: any) {
+      console.error(`[CC] Expansion pass ${passNum} failed: ${error.message}`);
+      break;
+    }
   }
   
-  return expandedText;
+  console.log(`[CC] Expansion complete: ${inputWords} → ${currentWords} words (target: ${targetWords})`);
+  return currentText;
 }
 
 export interface CCReconstructionResult {
