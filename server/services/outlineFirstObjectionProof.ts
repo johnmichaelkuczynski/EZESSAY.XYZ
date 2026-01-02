@@ -1239,12 +1239,15 @@ export async function generateOutlineFirstObjectionProof(
     
     // CHECK IF INPUT IS ALREADY IN NUMBERED FORMAT (from reconstruction)
     // If so, preserve that format rather than breaking it with section-based processing
-    const inputFormat = detectInputNumberedFormat(originalText);
-    if (inputFormat.isNumberedFormat && inputFormat.itemCount >= 3) {
-      console.log(`[OBJECTION-PROOF] Input already in numbered format: ${inputFormat.itemCount} items, quoted claims: ${inputFormat.hasQuotedClaims}`);
-      console.log(`[OBJECTION-PROOF] Using format-preserving rewrite to maintain structure`);
-      return formatPreservingRewrite(originalText, objectionsOutput, inputFormat, customInstructions, onProgress);
+    const wantsEssay = !customInstructions || /ESSAY|SECTIONS?/i.test(customInstructions);
+
+    if (!wantsEssay) {
+      const inputFormat = detectInputNumberedFormat(originalText);
+      if (inputFormat.isNumberedFormat && inputFormat.itemCount >= 3) {
+        return formatPreservingRewrite(originalText, objectionsOutput, inputFormat, customInstructions, onProgress);
+      }
     }
+
     
     onProgress?.('init', 0, 5, `Processing ${totalWords} word document...`);
     
